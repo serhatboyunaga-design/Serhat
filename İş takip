@@ -1,0 +1,393 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Proje dosyalarini olustur
+        run: |
+          cat > settings.gradle.kts <<'PROJ_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "BlokFoto"
+          include(":app")
+          PROJ_EOF
+          cat > build.gradle.kts <<'PROJ_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          PROJ_EOF
+          cat > gradle.properties <<'PROJ_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          PROJ_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'PROJ_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.blokfoto"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.example.blokfoto"
+                  minSdk = 29
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          PROJ_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'PROJ_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <application
+                  android:allowBackup="true"
+                  android:label="Blok Foto Arşiv"
+                  android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          PROJ_EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/file_paths.xml <<'PROJ_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <files-path name="photos" path="photos/" />
+          </paths>
+          PROJ_EOF
+          mkdir -p app/src/main/java/com/example/blokfoto
+          cat > app/src/main/java/com/example/blokfoto/MainActivity.kt <<'PROJ_EOF'
+          package com.example.blokfoto
+
+          import android.app.AlertDialog
+          import android.content.ContentValues
+          import android.graphics.*
+          import android.graphics.pdf.PdfDocument
+          import android.media.ExifInterface
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.text.StaticLayout
+          import android.text.TextPaint
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.FileProvider
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class Entry(var file: String, var block: String, var floor: String, var desc: String, var status: Int, var time: Long)
+
+          val STATUS = arrayOf("Uygun", "Eksik", "Hatalı")
+          val COLORS = intArrayOf(0xFF2E7D32.toInt(), 0xFFEF6C00.toInt(), 0xFFC62828.toInt())
+
+          class MainActivity : AppCompatActivity() {
+              private val items = mutableListOf<Entry>()
+              private val shown = mutableListOf<Entry>()
+              private var filter: String? = null
+              private val thumbs = HashMap<String, Bitmap>()
+              private lateinit var adapter: BaseAdapter
+              private lateinit var filterBtn: Button
+              private var pending: File? = null
+              private val db get() = File(filesDir, "archive.json")
+              private val photoDir get() = File(filesDir, "photos").apply { mkdirs() }
+              private val prefs by lazy { getSharedPreferences("info", MODE_PRIVATE) }
+              private val fmt = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale("tr"))
+
+              private val takePic = registerForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+                  val f = pending
+                  if (ok && f != null) {
+                      val last = items.lastOrNull()
+                      askInfo(Entry(f.name, last?.block ?: "", last?.floor ?: "", "", 0, System.currentTimeMillis()), true)
+                  } else f?.delete()
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  load()
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
+                  val bar = LinearLayout(this)
+                  fun btn(t: String, a: () -> Unit) = Button(this).apply { text = t; textSize = 13f; setOnClickListener { a() } }
+                  fun add(b: Button) = bar.addView(b, LinearLayout.LayoutParams(0, -2, 1f))
+                  add(btn("📷 Fotoğraf Çek") { shoot() })
+                  filterBtn = btn("Blok: Tümü") { pickFilter() }; add(filterBtn)
+                  add(btn("🏗 Şantiye Bilgisi") { askInfoSite() })
+                  add(btn("📄 PDF Kaydet") { makePdf() })
+                  root.addView(bar)
+
+                  adapter = object : BaseAdapter() {
+                      override fun getCount() = shown.size
+                      override fun getItem(p: Int) = shown[p]
+                      override fun getItemId(p: Int) = p.toLong()
+                      override fun getView(p: Int, v: View?, parent: ViewGroup?): View {
+                          val e = shown[p]
+                          val ctx = this@MainActivity
+                          val row = LinearLayout(ctx).apply { setPadding(8, 12, 8, 12); gravity = Gravity.CENTER_VERTICAL }
+                          val img = ImageView(ctx).apply {
+                              layoutParams = LinearLayout.LayoutParams(260, 260)
+                              scaleType = ImageView.ScaleType.CENTER_CROP
+                              setImageBitmap(thumbs.getOrPut(e.file) { decode(File(photoDir, e.file), 260) })
+                          }
+                          val col = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 0, 0, 0) }
+                          col.addView(TextView(ctx).apply {
+                              textSize = 17f; setTypeface(null, Typeface.BOLD)
+                              text = "${items.indexOf(e) + 1}. Blok: ${e.block}  |  ${e.floor}"
+                          })
+                          col.addView(TextView(ctx).apply {
+                              textSize = 15f; setTypeface(null, Typeface.BOLD)
+                              setTextColor(COLORS[e.status]); text = "● " + STATUS[e.status]
+                          })
+                          col.addView(TextView(ctx).apply { textSize = 14f; text = fmt.format(Date(e.time)) + "\n" + e.desc })
+                          row.addView(img); row.addView(col)
+                          return row
+                      }
+                  }
+                  val list = ListView(this).apply {
+                      adapter = this@MainActivity.adapter
+                      setOnItemClickListener { _, _, p, _ -> askInfo(shown[p], false) }
+                      setOnItemLongClickListener { _, _, p, _ ->
+                          AlertDialog.Builder(this@MainActivity).setMessage("Bu kayıt silinsin mi?")
+                              .setPositiveButton("Sil") { _, _ ->
+                                  val e = shown[p]
+                                  File(photoDir, e.file).delete(); thumbs.remove(e.file); items.remove(e)
+                                  if (items.none { it.block == filter }) filter = null
+                                  save(); refresh()
+                              }.setNegativeButton("Vazgeç", null).show()
+                          true
+                      }
+                  }
+                  root.addView(list)
+                  setContentView(root)
+                  refresh()
+              }
+
+              private fun refresh() {
+                  shown.clear(); shown.addAll(items.filter { filter == null || it.block == filter })
+                  filterBtn.text = "Blok: " + (filter ?: "Tümü")
+                  adapter.notifyDataSetChanged()
+              }
+
+              private fun pickFilter() {
+                  val blocks = items.map { it.block }.distinct().sortedBy { it.lowercase() }
+                  val opts = (listOf("Tümü") + blocks).toTypedArray()
+                  AlertDialog.Builder(this).setTitle("Blok seç").setItems(opts) { _, i ->
+                      filter = if (i == 0) null else opts[i]; refresh()
+                  }.show()
+              }
+
+              private fun shoot() {
+                  val f = File(photoDir, "IMG_${System.currentTimeMillis()}.jpg")
+                  pending = f
+                  takePic.launch(FileProvider.getUriForFile(this, "$packageName.fileprovider", f))
+              }
+
+              private fun field(hint: String, value: String, lines: Int = 1) =
+                  EditText(this).apply { this.hint = hint; setText(value); minLines = lines }
+
+              private fun askInfoSite() {
+                  val s = field("Şantiye adı", prefs.getString("site", "") ?: "")
+                  val c = field("Firma", prefs.getString("company", "") ?: "")
+                  val a = field("Hazırlayan", prefs.getString("author", "") ?: "")
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(48, 16, 48, 0); addView(s); addView(c); addView(a)
+                  }
+                  AlertDialog.Builder(this).setTitle("Şantiye bilgisi").setView(box)
+                      .setPositiveButton("Kaydet") { _, _ ->
+                          prefs.edit().putString("site", s.text.toString().trim())
+                              .putString("company", c.text.toString().trim())
+                              .putString("author", a.text.toString().trim()).apply()
+                      }.setNegativeButton("İptal", null).show()
+              }
+
+              private fun askInfo(e: Entry, isNew: Boolean) {
+                  val blk = field("Blok adı", e.block)
+                  val flr = field("Kat / Mahal", e.floor)
+                  val st = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, STATUS)
+                      setSelection(e.status)
+                  }
+                  val dsc = field("Açıklama", e.desc, 3)
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(48, 16, 48, 0)
+                      addView(blk); addView(flr); addView(st); addView(dsc)
+                  }
+                  AlertDialog.Builder(this).setTitle("Fotoğraf bilgisi").setView(box).setCancelable(false)
+                      .setPositiveButton("Kaydet") { _, _ ->
+                          e.block = blk.text.toString().trim(); e.floor = flr.text.toString().trim()
+                          e.status = st.selectedItemPosition; e.desc = dsc.text.toString().trim()
+                          if (isNew) items.add(e)
+                          save(); refresh()
+                      }
+                      .setNegativeButton("İptal") { _, _ -> if (isNew) File(photoDir, e.file).delete() }
+                      .show()
+              }
+
+              private fun decode(f: File, max: Int): Bitmap {
+                  val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  BitmapFactory.decodeFile(f.path, o)
+                  var s = 1
+                  while (o.outWidth / s > max * 2 || o.outHeight / s > max * 2) s *= 2
+                  var bmp = BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = s })
+                  val deg = when (ExifInterface(f.path).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)) {
+                      6 -> 90f; 3 -> 180f; 8 -> 270f; else -> 0f
+                  }
+                  if (deg != 0f) bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(deg) }, true)
+                  return bmp
+              }
+
+              private fun makePdf() {
+                  if (items.isEmpty()) { Toast.makeText(this, "Önce fotoğraf ekleyin", Toast.LENGTH_SHORT).show(); return }
+                  val w = 595; val h = 842; val m = 36
+                  val site = prefs.getString("site", "")?.ifEmpty { "-" } ?: "-"
+                  val company = prefs.getString("company", "")?.ifEmpty { "-" } ?: "-"
+                  val author = prefs.getString("author", "")?.ifEmpty { "-" } ?: "-"
+                  val sorted = items.withIndex().sortedWith(compareBy({ it.value.block.lowercase() }, { it.index })).map { it.value }
+                  val groups = sorted.groupBy { it.block }.values
+                  val total = 1 + groups.sumOf { (it.size + 1) / 2 }
+                  val pdf = PdfDocument()
+                  val tp = TextPaint().apply { textSize = 12f; color = Color.BLACK; isAntiAlias = true }
+                  val bp = TextPaint(tp).apply { textSize = 14f; typeface = Typeface.DEFAULT_BOLD }
+                  val line = Paint().apply { color = Color.LTGRAY; strokeWidth = 1f }
+                  fun text(c: Canvas, s: String, p: TextPaint, y: Float): Float {
+                      val l = StaticLayout.Builder.obtain(s, 0, s.length, p, w - 2 * m).build()
+                      c.save(); c.translate(m.toFloat(), y); l.draw(c); c.restore()
+                      return y + l.height + 6
+                  }
+                  fun footer(c: Canvas, n: Int) {
+                      c.drawLine(m.toFloat(), 812f, (w - m).toFloat(), 812f, line)
+                      c.drawText("$site", m.toFloat(), 828f, tp)
+                      c.drawText("Sayfa $n / $total", (w - m - 70).toFloat(), 828f, tp)
+                  }
+
+                  // Kapak
+                  var page = pdf.startPage(PdfDocument.PageInfo.Builder(w, h, 1).create())
+                  var c = page.canvas
+                  val title = TextPaint(bp).apply { textSize = 28f; textAlign = Paint.Align.CENTER }
+                  c.drawText("FOTOĞRAF RAPORU", w / 2f, 200f, title)
+                  c.drawLine(m.toFloat(), 220f, (w - m).toFloat(), 220f, line)
+                  val big = TextPaint(tp).apply { textSize = 16f }
+                  var y = 270f
+                  for (s in listOf("Şantiye: $site", "Firma: $company", "Hazırlayan: $author",
+                      "Rapor tarihi: " + fmt.format(Date()), "Toplam fotoğraf: ${items.size}",
+                      "Uygun: ${items.count { it.status == 0 }}   Eksik: ${items.count { it.status == 1 }}   Hatalı: ${items.count { it.status == 2 }}"))
+                      y = text(c, s, big, y) + 12
+                  footer(c, 1)
+                  pdf.finishPage(page)
+
+                  // Fotoğraf sayfaları: bloğa göre gruplu, sayfada 2 fotoğraf
+                  var pageNo = 1; var n = 0
+                  val stamp = Paint(tp).apply { color = Color.WHITE; textSize = 11f }
+                  val shade = Paint().apply { color = 0x99000000.toInt() }
+                  for (g in groups) for (chunk in g.chunked(2)) {
+                      pageNo++
+                      page = pdf.startPage(PdfDocument.PageInfo.Builder(w, h, pageNo).create())
+                      c = page.canvas
+                      c.drawText("Blok: ${chunk[0].block}", m.toFloat(), 52f, bp)
+                      c.drawLine(m.toFloat(), 62f, (w - m).toFloat(), 62f, line)
+                      chunk.forEachIndexed { k, e ->
+                          n++
+                          val top = 76f + k * 366f
+                          val bmp = decode(File(photoDir, e.file), 1600)
+                          val maxW = (w - 2 * m).toFloat(); val maxH = 215f
+                          val sc = minOf(maxW / bmp.width, maxH / bmp.height)
+                          val iw = bmp.width * sc; val ih = bmp.height * sc
+                          val left = m + (maxW - iw) / 2
+                          c.drawBitmap(bmp, null, RectF(left, top, left + iw, top + ih), null)
+                          val label = fmt.format(Date(e.time)); val tw = stamp.measureText(label)
+                          c.drawRect(left + iw - tw - 12, top + ih - 20, left + iw, top + ih, shade)
+                          c.drawText(label, left + iw - tw - 6, top + ih - 6, stamp)
+                          bmp.recycle()
+                          var y2 = top + 215f + 8f
+                          y2 = text(c, "$n.  Blok: ${e.block}   |   Kat/Mahal: ${e.floor}", bp, y2)
+                          val sp = TextPaint(bp).apply { color = COLORS[e.status] }
+                          y2 = text(c, "Durum: " + STATUS[e.status], sp, y2)
+                          text(c, e.desc, tp, y2)
+                      }
+                      footer(c, pageNo)
+                      pdf.finishPage(page)
+                  }
+
+                  val name = "BlokFoto_" + SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date()) + ".pdf"
+                  val cv = ContentValues().apply {
+                      put(MediaStore.Downloads.DISPLAY_NAME, name)
+                      put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
+                      put(MediaStore.Downloads.RELATIVE_PATH, "Download")
+                  }
+                  val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                  if (uri != null) contentResolver.openOutputStream(uri)?.use { pdf.writeTo(it) }
+                  pdf.close()
+                  Toast.makeText(this, "PDF kaydedildi: İndirilenler/$name", Toast.LENGTH_LONG).show()
+              }
+
+              private fun save() {
+                  val a = JSONArray()
+                  items.forEach {
+                      a.put(JSONObject().put("f", it.file).put("b", it.block).put("k", it.floor)
+                          .put("d", it.desc).put("s", it.status).put("t", it.time))
+                  }
+                  db.writeText(a.toString())
+              }
+
+              private fun load() {
+                  if (!db.exists()) return
+                  val a = JSONArray(db.readText())
+                  for (i in 0 until a.length()) {
+                      val o = a.getJSONObject(i)
+                      val f = o.getString("f")
+                      items.add(Entry(f, o.getString("b"), o.optString("k", ""), o.getString("d"), o.optInt("s", 0),
+                          o.optLong("t", File(photoDir, f).lastModified())))
+                  }
+              }
+          }
+          PROJ_EOF
+      - run: gradle assembleDebug
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: BlokFoto APK ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
